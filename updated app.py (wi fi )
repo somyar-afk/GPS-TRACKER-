@@ -1,0 +1,680 @@
+"""
+GPS & Wi-Fi Trilateration Animal Tracking Collar — Flask Backend
+=================================================================
+Requires: Flask, flask-cors, firebase-admin (optional), gunicorn
+Env vars:
+  DEVICE_TOKEN           — Bearer token the ESP32 sends
+  VIEW_TOKEN             — Bearer token the browser dashboard sends
+  HOME_LAT / HOME_LNG    — Geofence centre (default: IIT Roorkee main building)
+  GEOFENCE_RADIUS_METERS — Geofence radius (default 50 m)
+  LOC_MODE               — "wifi_primary" (default) | "wifi_only" | "hybrid"
+  WIFI_RSSI_1M           — Calibrated RSSI at 1 m in dBm (default -42.0)
+  WIFI_PATH_LOSS         — Path-loss exponent n (default 2.8)
+  WIFI_MIN_RSSI          — Minimum usable AP RSSI in dBm (default -85.0)
+"""
+
+import copy
+import hmac
+import json
+import math
+import os
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+from flask import Flask, abort, jsonify, request, send_from_directory
+from flask_cors import CORS
+from geofence_filter import GeofenceFilter
+from settings_store import SettingsStore, SettingsUnavailable
+
+# ---------------------------------------------------------------------------
+# Firebase / FCM — optional; gracefully disabled when creds are absent
+# ---------------------------------------------------------------------------
+try:
+    import firebase_admin
+    from firebase_admin import credentials, messaging as fcm_messaging
+
+    _fb_cred_path = os.environ.get("FIREBASE_CREDENTIALS_PATH") or next(
+        (
+            str(path)
+            for path in [
+                Path(__file__).with_name("firebase-admin.json"),
+                Path("/etc/secrets/firebase-admin.json"),
+            ]
+            if path.exists()
+        ),
+        str(Path(__file__).with_name("firebase-admin.json")),
+    )
+    if os.path.exists(_fb_cred_path):
+        firebase_admin.initialize_app(credentials.Certificate(_fb_cred_path))
+        FCM_ENABLED = True
+    else:
+        FCM_ENABLED = False
+        print(
+            "⚠  firebase-admin.json not found — FCM push notifications disabled."
+            " Place the file next to app.py to enable them."
+        )
+except ImportError:
+    FCM_ENABLED = False
+    print(
+        "⚠  firebase-admin not installed — FCM push notifications disabled."
+        " pip install firebase-admin to enable them."
+    )
+
+if os.environ.get("REQUIRE_FCM", "false").lower() == "true" and not FCM_ENABLED:
+    raise RuntimeError("Firebase credentials are required for this deployment")
+
+_settings_backend = os.environ.get("SETTINGS_BACKEND", "local")
+_firestore_client = None
+if _settings_backend == "firestore":
+    if not FCM_ENABLED:
+        raise RuntimeError("Firestore settings require Firebase credentials")
+    from firebase_admin import firestore
+
+    _firestore_client = firestore.client()
+settings_store = SettingsStore(
+    _settings_backend, _firestore_client, os.environ.get("TRACKER_ID", "animal-01")
+)
+
+# ---------------------------------------------------------------------------
+# App setup
+# ---------------------------------------------------------------------------
+app = Flask(__name__, static_folder="static")
+app.config["MAX_CONTENT_LENGTH"] = 8192
+
+CORS(app, resources={r"/api/*": {"origins": "*"}})
+
+# ---------------------------------------------------------------------------
+# Auth tokens
+# ---------------------------------------------------------------------------
+# Local settings stay out of Git. Explicit environment variables take precedence.
+_config_path = Path(__file__).with_name("config.local.json")
+_local_config = json.loads(_config_path.read_text()) if _config_path.exists() else {}
+DEVICE_TOKEN = os.environ.get("DEVICE_TOKEN", _local_config.get("DEVICE_TOKEN", ""))
+VIEW_TOKEN = os.environ.get("VIEW_TOKEN", _local_config.get("VIEW_TOKEN", ""))
+
+if min(len(DEVICE_TOKEN), len(VIEW_TOKEN)) < 32 or DEVICE_TOKEN == VIEW_TOKEN:
+    raise RuntimeError(
+        "Set DIFFERENT random DEVICE_TOKEN and VIEW_TOKEN (at least 32 chars each). "
+        "Set them in config.local.json or export them before starting."
+    )
+
+# ---------------------------------------------------------------------------
+# Geofence configuration
+# ---------------------------------------------------------------------------
+GEOFENCE_SETTINGS_PATH = Path(
+    os.environ.get(
+        "GEOFENCE_SETTINGS_PATH", str(Path(__file__).with_name("geofence.local.json"))
+    )
+)
+
+
+def load_geofence_settings():
+    defaults = {
+        "home_lat": float(os.environ.get("HOME_LAT", "29.8656")),
+        "home_lng": float(os.environ.get("HOME_LNG", "77.8961")),
+        "radius_m": float(os.environ.get("GEOFENCE_RADIUS_METERS", "50")),
+    }
+    settings = settings_store.load("geofence", GEOFENCE_SETTINGS_PATH, defaults)
+    for field, low, high in [
+        ("home_lat", -90, 90),
+        ("home_lng", -180, 180),
+        ("radius_m", 1, 100000),
+    ]:
+        value = settings.get(field)
+        if (
+            type(value) not in (int, float)
+            or not math.isfinite(value)
+            or not low <= value <= high
+        ):
+            raise ValueError(f"Invalid saved geofence {field}")
+    return {field: settings[field] for field in defaults}
+
+
+geofence_settings = load_geofence_settings()
+
+TRACKER_SETTINGS_PATH = Path(
+    os.environ.get(
+        "TRACKER_SETTINGS_PATH", str(Path(__file__).with_name("tracker.local.json"))
+    )
+)
+
+
+def valid_tracker_name(value):
+    if not isinstance(value, str):
+        return False
+    return 1 <= len(value.strip()) <= 64 and not any(
+        ord(c) < 32 or ord(c) == 127 for c in value
+    )
+
+
+def load_tracker_settings():
+    settings = settings_store.load(
+        "tracker", TRACKER_SETTINGS_PATH, {"name": "animal-01"}
+    )
+    if not valid_tracker_name(settings.get("name")):
+        raise ValueError("Invalid saved tracker name")
+    return {"name": settings["name"].strip()}
+
+
+tracker_settings = load_tracker_settings()
+
+# ---------------------------------------------------------------------------
+# Wi-Fi Trilateration Configuration & Known APs
+# Format:  "aa:bb:cc:dd:ee:ff": (lat, lon)
+# Place at least 3 non-collinear surveyed APs around the tracking area.
+# ---------------------------------------------------------------------------
+EARTH_RADIUS_M = 6_371_000.0
+
+# "wifi_only"    -> ignore GPS completely, track via Wi-Fi only
+# "wifi_primary" -> use Wi-Fi triangulation whenever >=1 known AP is seen; fall back to GPS
+# "hybrid"       -> fuse GPS and Wi-Fi when both are available
+LOC_MODE = os.environ.get("LOC_MODE", "wifi_primary")
+if LOC_MODE not in ("wifi_only", "wifi_primary", "hybrid"):
+    raise ValueError("LOC_MODE must be 'wifi_only', 'wifi_primary', or 'hybrid'")
+
+# RF propagation calibration constants (tune on-site)
+RSSI_AT_1M = float(os.environ.get("WIFI_RSSI_1M", "-42.0"))
+PATH_LOSS_EXPONENT = float(os.environ.get("WIFI_PATH_LOSS", "2.8"))
+MIN_WIFI_RSSI = float(os.environ.get("WIFI_MIN_RSSI", "-85.0"))
+
+KNOWN_WIFI_APS: dict[str, tuple[float, float]] = {
+    # Example IITR campus APs — replace with real BSSIDs from site survey:
+    "aa:bb:cc:dd:ee:01": (29.8656, 77.8961),  # Main building AP
+    "aa:bb:cc:dd:ee:02": (29.8660, 77.8970),  # Library AP
+    "aa:bb:cc:dd:ee:03": (29.8650, 77.8955),  # Hostel block AP
+    "aa:bb:cc:dd:ee:04": (29.8658, 77.8952),  # Lecture hall AP
+}
+
+# ---------------------------------------------------------------------------
+# Shared state (single-process / single-worker only)
+# ---------------------------------------------------------------------------
+lock = threading.Lock()
+
+state = {
+    "heartbeat_at": None,
+    "telemetry": None,
+    "position": None,
+    "history": [],  # list of recent positions (last 20)
+    "geofence": None,  # geofence status object
+}
+
+_history: deque = deque(maxlen=20)
+geofence_filter = GeofenceFilter()
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Return great-circle distance in metres between two WGS-84 points."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dphi / 2) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    )
+    return EARTH_RADIUS_M * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _send_fcm_alert(distance_m: float, tracker_name: str | None = None) -> None:
+    """Fire a high-priority FCM push to topic 'geofence_alerts' (best-effort)."""
+    if not FCM_ENABLED:
+        return
+    if tracker_name is None:
+        with lock:
+            tracker_name = tracker_settings["name"]
+    try:
+        message = fcm_messaging.Message(
+            notification=fcm_messaging.Notification(
+                title=f"{tracker_name} — geofence alert",
+                body=f"{tracker_name} is {distance_m:.0f} m from the safe-zone centre.",
+            ),
+            android=fcm_messaging.AndroidConfig(priority="high"),
+            topic="geofence_alerts",
+        )
+        fcm_messaging.send(message)
+        print(f"FCM alert sent — distance {distance_m:.1f} m")
+    except Exception as exc:
+        print(f"FCM send failed: {exc}")
+
+
+def authorize(token: str) -> None:
+    supplied = request.headers.get("Authorization", "")
+    expected = "Bearer " + token
+    if not hmac.compare_digest(supplied.encode(), expected.encode()):
+        abort(401)
+
+
+def number(data: dict, key: str, low: float, high: float, optional: bool = False):
+    value = data.get(key)
+    if value is None and optional:
+        return None
+    if (
+        type(value) not in (float, int)
+        or not math.isfinite(value)
+        or not low <= value <= high
+    ):
+        abort(400, description=f"Invalid {key}")
+    return value
+
+
+def _rssi_to_distance_m(rssi: float) -> float:
+    """Convert RSSI (dBm) to estimated distance (m) via log-distance path loss."""
+    exponent = (RSSI_AT_1M - rssi) / (10.0 * PATH_LOSS_EXPONENT)
+    return max(1.0, min(250.0, 10.0**exponent))
+
+
+def _trilaterate_wifi(
+    matched: list[tuple[str, float, float, float]],
+) -> tuple[float, float, str]:
+    """
+    Estimate (lat, lon, loc_source) from matched APs: [(bssid, rssi, lat, lon), ...].
+    Uses damped Gauss-Newton nonlinear least squares for >=3 APs,
+    inverse-distance weighting for 2 APs, and AP anchor for 1 AP.
+    """
+    matched.sort(key=lambda item: item[1], reverse=True)
+
+    if len(matched) == 1:
+        return matched[0][2], matched[0][3], "wifi_1ap"
+
+    points = []
+    for _, rssi, lat, lon in matched[:8]:
+        dist = _rssi_to_distance_m(rssi)
+        weight = 1.0 / (dist**2)
+        points.append((lat, lon, dist, weight))
+
+    total_w = sum(p[3] for p in points)
+    lat0 = sum(p[0] * p[3] for p in points) / total_w
+    lon0 = sum(p[1] * p[3] for p in points) / total_w
+
+    if len(points) == 2:
+        return lat0, lon0, "wifi_2ap"
+
+    # Project (lat, lon) to local planar meters relative to (lat0, lon0)
+    cos_lat0 = math.cos(math.radians(lat0))
+    planar = []
+    for lat, lon, dist, weight in points:
+        x = math.radians(lon - lon0) * cos_lat0 * EARTH_RADIUS_M
+        y = math.radians(lat - lat0) * EARTH_RADIUS_M
+        planar.append((x, y, dist, weight))
+
+    # Damped Gauss-Newton iterations starting at the weighted centroid (0, 0)
+    est_x, est_y = 0.0, 0.0
+    damping = 1e-3
+
+    for _ in range(20):
+        jtwj_00 = jtwj_01 = jtwj_11 = damping
+        jtwe_0 = jtwe_1 = 0.0
+
+        for xi, yi, di, wi in planar:
+            dx = est_x - xi
+            dy = est_y - yi
+            ri = math.hypot(dx, dy)
+            if ri < 1e-4:
+                continue
+            jx = dx / ri
+            jy = dy / ri
+            err = ri - di
+
+            jtwj_00 += wi * jx * jx
+            jtwj_01 += wi * jx * jy
+            jtwj_11 += wi * jy * jy
+            jtwe_0 -= wi * jx * err
+            jtwe_1 -= wi * jy * err
+
+        det = jtwj_00 * jtwj_11 - jtwj_01 * jtwj_01
+        if abs(det) < 1e-12:
+            break
+
+        step_x = (jtwj_11 * jtwe_0 - jtwj_01 * jtwe_1) / det
+        step_y = (-jtwj_01 * jtwe_0 + jtwj_00 * jtwe_1) / det
+        est_x += step_x
+        est_y += step_y
+
+        if math.hypot(step_x, step_y) < 0.01:
+            break
+
+    resolved_lat = lat0 + math.degrees(est_y / EARTH_RADIUS_M)
+    resolved_lon = lon0 + math.degrees(est_x / (EARTH_RADIUS_M * cos_lat0))
+    return resolved_lat, resolved_lon, "wifi_trilateration"
+
+
+def _resolve_position(
+    gps_lat: float | None,
+    gps_lon: float | None,
+    fix_ok: bool,
+    hdop: float | None,
+    wifi_aps: list | None,
+) -> tuple[float | None, float | None, str]:
+    """
+    Resolve position using Wi-Fi trilateration and/or GPS according to LOC_MODE.
+
+    Returns (resolved_lat, resolved_lon, loc_source)
+    """
+    matched: list[tuple[str, float, float, float]] = []
+    if wifi_aps:
+        for ap in wifi_aps:
+            bssid = str(ap.get("bssid", "")).strip().lower()
+            rssi = ap.get("rssi")
+            if (
+                isinstance(rssi, (int, float))
+                and bssid in KNOWN_WIFI_APS
+                and rssi >= MIN_WIFI_RSSI
+            ):
+                wlat, wlon = KNOWN_WIFI_APS[bssid]
+                matched.append((bssid, float(rssi), wlat, wlon))
+
+    if LOC_MODE == "wifi_only":
+        if not matched:
+            return None, None, "none"
+        return _trilaterate_wifi(matched)
+
+    if not matched:
+        if fix_ok and gps_lat is not None and gps_lon is not None:
+            return gps_lat, gps_lon, "gps"
+        return None, None, "none"
+
+    wifi_lat, wifi_lon, wifi_source = _trilaterate_wifi(matched)
+
+    if LOC_MODE == "wifi_primary" or not fix_ok or gps_lat is None or gps_lon is None:
+        return wifi_lat, wifi_lon, wifi_source
+
+    # Hybrid fusion when both GPS and Wi-Fi are available
+    poor_gps = hdop is not None and hdop > 2.0
+    wifi_weight = 0.75 if (wifi_source == "wifi_trilateration" or poor_gps) else 0.40
+    gps_weight = 1.0 - wifi_weight
+    return (
+        gps_weight * gps_lat + wifi_weight * wifi_lat,
+        gps_weight * gps_lon + wifi_weight * wifi_lon,
+        f"gps+{wifi_source}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Security headers
+# ---------------------------------------------------------------------------
+@app.after_request
+def security_headers(response):
+    if request.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+@app.get("/")
+def index():
+    return send_from_directory("static", "index.html")
+
+
+@app.get("/map.js")
+def dashboard_script():
+    return send_from_directory("static", "map.js")
+
+
+@app.get("/server-config.js")
+def server_config_script():
+    return send_from_directory("static", "server-config.js")
+
+
+@app.get("/token-session.js")
+def session_script():
+    return send_from_directory("static", "token-session.js")
+
+
+@app.get("/health")
+def health():
+    return jsonify({"ok": True})
+
+
+@app.post("/api/telemetry")
+def telemetry():
+    authorize(DEVICE_TOKEN)
+
+    if request.content_length and request.content_length > 8192:
+        abort(413)
+
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict) or type(data.get("fix_ok")) is not bool:
+        abort(400)
+
+    reason = data.get("reason", "")
+    allowed_reasons = {
+        "waiting",
+        "fresh",
+        "weak_fix",
+        "jump_rejected",
+        "reacquired",
+        "stale",
+    }
+    if reason not in allowed_reasons:
+        abort(400)
+
+    if type(data.get("mpu_ok")) is not bool:
+        abort(400)
+
+    # Validate activity field (optional, default "Moving")
+    activity_raw = data.get("activity", "Moving")
+    if activity_raw not in ("Resting", "Grazing", "Moving"):
+        activity_raw = "Moving"
+
+    clean = {
+        "fix_ok": data["fix_ok"],
+        "reason": reason,
+        "mpu_ok": data["mpu_ok"],
+        "activity": activity_raw,
+    }
+
+    # GPS scalar fields
+    for key, low, high in [
+        ("satellites", 0, 100),
+        ("hdop", 0, 1000),
+        ("speed_kmph", 0, 2000),
+        ("altitude_m", -20000, 100000),
+    ]:
+        clean[key] = number(data, key, low, high, optional=True)
+
+    # BNO055 acceleration + gyroscope
+    for key in ("ax", "ay", "az", "gx", "gy", "gz"):
+        clean[key] = number(data, key, -1000, 1000, optional=True)
+
+    # Wi-Fi APs (accept up to 15 scanned APs so known routers are not dropped)
+    wifi_aps_raw = data.get("wifi_aps")
+    wifi_aps: list | None = None
+    if isinstance(wifi_aps_raw, list):
+        wifi_aps = []
+        for ap in wifi_aps_raw[:15]:
+            if isinstance(ap, dict):
+                bssid = ap.get("bssid", "")
+                rssi = ap.get("rssi")
+                if isinstance(bssid, str) and isinstance(rssi, (int, float)):
+                    wifi_aps.append({"bssid": bssid[:17], "rssi": float(rssi)})
+        if not wifi_aps:
+            wifi_aps = None
+
+    now = time.time()
+    position = None
+    loc_source = "none"
+
+    gps_lat: float | None = None
+    gps_lon: float | None = None
+    fix_at: float = now
+    gps_valid = False
+
+    if data["fix_ok"] and LOC_MODE != "wifi_only":
+        gps_lat = number(data, "lat", -90, 90)
+        gps_lon = number(data, "lon", -180, 180)
+        fix_at = number(data, "fix_epoch", 1_577_836_800, now + 2)
+
+        if now - fix_at > 10:
+            clean.update(fix_ok=False, reason="stale")
+            gps_lat = None
+            gps_lon = None
+            fix_at = now
+        else:
+            gps_valid = True
+
+    resolved_lat, resolved_lon, loc_source = _resolve_position(
+        gps_lat, gps_lon, gps_valid, clean.get("hdop"), wifi_aps
+    )
+
+    if resolved_lat is not None and resolved_lon is not None:
+        position = {
+            "lat": resolved_lat,
+            "lon": resolved_lon,
+            "gps_lat": gps_lat if gps_valid else None,
+            "gps_lon": gps_lon if gps_valid else None,
+            "fix_at": fix_at if gps_valid else now,
+            "received_at": now,
+            "reason": reason if gps_valid else loc_source,
+            "loc_source": loc_source,
+        }
+
+    clean["loc_source"] = loc_source
+
+    alert_distance = None
+    alert_tracker_name = None
+    with lock:
+        geofence_status = geofence_for_position(position)
+        valid_fix = position is not None
+        distance = (
+            _haversine(
+                position["lat"],
+                position["lon"],
+                geofence_settings["home_lat"],
+                geofence_settings["home_lng"],
+            )
+            if position
+            else None
+        )
+        if geofence_filter.observe(
+            distance,
+            position["fix_at"] if position else None,
+            now,
+            geofence_settings["radius_m"],
+            valid_fix,
+        ):
+            alert_distance = geofence_status["distance_m"]
+            alert_tracker_name = tracker_settings["name"]
+        geofence_status = geofence_for_position(position)
+        state["heartbeat_at"] = now
+        state["telemetry"] = clean
+        state["geofence"] = geofence_status
+
+        if position and (
+            state["position"] is None
+            or position["fix_at"] >= state["position"]["fix_at"]
+        ):
+            state["position"] = position
+            _history.append(
+                {
+                    "lat": position["lat"],
+                    "lon": position["lon"],
+                    "fix_at": position["fix_at"],
+                    "loc_source": position["loc_source"],
+                }
+            )
+            state["history"] = list(_history)
+
+    if alert_distance is not None:
+        _send_fcm_alert(alert_distance, alert_tracker_name)
+
+    return jsonify({"ok": True})
+
+
+def geofence_for_position(position):
+    # Caller holds lock so telemetry and setting changes use one consistent boundary.
+    result = dict(geofence_settings, inside=None, distance_m=None)
+    distance = None
+    if position is not None:
+        distance = _haversine(
+            position["lat"],
+            position["lon"],
+            result["home_lat"],
+            result["home_lng"],
+        )
+        result.update(
+            inside=distance <= result["radius_m"], distance_m=round(distance, 1)
+        )
+    valid_fix = position is not None
+    result.update(geofence_filter.describe(distance, result["radius_m"], valid_fix))
+    return result
+
+
+@app.put("/api/geofence")
+def update_geofence():
+    authorize(VIEW_TOKEN)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        abort(400, description="Expected geofence settings")
+    settings = {
+        "home_lat": number(data, "home_lat", -90, 90),
+        "home_lng": number(data, "home_lng", -180, 180),
+        "radius_m": number(data, "radius_m", 1, 100000),
+    }
+    with lock:
+        try:
+            settings_store.save("geofence", GEOFENCE_SETTINGS_PATH, settings)
+        except SettingsUnavailable:
+            abort(503, description="Could not save the safe zone. Please try again.")
+        geofence_settings.update(settings)
+        geofence_filter.reset(state["position"]["fix_at"] if state["position"] else None)
+        # The next fresh telemetry packet evaluates alerts against the new boundary.
+        position = state["position"]
+        if position and time.time() - position["fix_at"] > 10:
+            position = None
+        state["geofence"] = geofence_for_position(position)
+        result = dict(state["geofence"])
+    return jsonify(result)
+
+
+@app.put("/api/tracker")
+def update_tracker():
+    authorize(VIEW_TOKEN)
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not valid_tracker_name(data.get("name")):
+        abort(
+            400,
+            description="Tracker name must contain 1–64 characters without control characters.",
+        )
+    settings = {"name": data["name"].strip()}
+    with lock:
+        try:
+            settings_store.save("tracker", TRACKER_SETTINGS_PATH, settings)
+        except SettingsUnavailable:
+            abort(503, description="Could not save the tracker name. Please try again.")
+        tracker_settings.update(settings)
+        result = dict(tracker_settings)
+    return jsonify(result)
+
+
+@app.get("/api/latest")
+def latest():
+    authorize(VIEW_TOKEN)
+
+    with lock:
+        result = copy.deepcopy(state)
+        result["tracker"] = dict(tracker_settings)
+        position = result["position"]
+        if position and time.time() - position["fix_at"] > 10:
+            position = None
+        result["geofence"] = geofence_for_position(position)
+
+    result["server_now"] = time.time()
+    return jsonify(result)
+
+
+if __name__ == "__main__":
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", _local_config.get("PORT", 8000))),
+        debug=False,
+    )
